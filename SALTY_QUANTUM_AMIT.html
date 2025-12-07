@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SALTY AR</title>
+    
+    <!-- AI Library (Lite) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        
+        #webcam {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            object-fit: cover; transform: scaleX(-1);
+            z-index: -1; filter: brightness(0.1) contrast(1.2);
+        }
+        canvas { display: block; position: absolute; top: 0; left: 0; z-index: 1; }
+
+        /* HEADER: Bright Lavender SALTY */
+        #header { position: absolute; top: 40px; left: 40px; pointer-events: none; z-index: 10; }
+        
+        h1 {
+            margin: 0; font-size: 4rem; 
+            color: #d8b5ff; 
+            text-shadow: 0 0 10px #fff, 0 0 20px #b026ff, 0 0 40px #8000ff;
+            font-weight: 900; letter-spacing: 5px; font-style: italic;
+        }
+
+        /* CONTROLS */
+        #controls {
+            position: absolute; bottom: 40px; width: 100%; text-align: center;
+            z-index: 20; pointer-events: none;
+        }
+        
+        .selector { pointer-events: auto; display: inline-flex; gap: 20px; }
+
+        .btn {
+            background: rgba(0, 0, 0, 0.6); 
+            border: 2px solid rgba(255,255,255,0.3); padding: 12px 35px;
+            color: #ccc; font-weight: 800; text-transform: uppercase; cursor: pointer;
+            border-radius: 50px; transition: 0.3s;
+            font-size: 0.9rem; letter-spacing: 2px;
+            backdrop-filter: blur(5px);
+        }
+
+        .btn:hover { color: #fff; transform: scale(1.05); border-color: #fff;}
+
+        /* Active Tree: Green Glow */
+        .btn.active { 
+            background: #fff; color: #000; 
+            border-color: #00ff00; 
+            box-shadow: 0 0 25px rgba(0, 255, 0, 0.6); 
+        }
+
+        /* Active Star: Red Glow */
+        .btn.star.active { 
+            background: #ff2a2a; color: #fff; border-color: #ff0000;
+            box-shadow: 0 0 30px #ff0000; 
+        }
+
+    </style>
+</head>
+<body>
+
+    <video id="webcam" playsinline></video>
+
+    <div id="header">
+        <h1>SALTY</h1>
+    </div>
+
+    <div id="controls">
+        <div class="selector">
+            <button class="btn active" id="btn-tree" onclick="setMode('tree')">Tree</button>
+            <button class="btn star" id="btn-star" onclick="setMode('star')">Star</button>
+        </div>
+    </div>
+
+    <!-- SHADER: OPTICAL FLAARES & PHYSICS -->
+    <script type="x-shader/x-vertex" id="vertexShader">
+        attribute float size;
+        attribute vec3 customColor;
+        varying vec3 vColor;
+        varying float vAlpha;
+        uniform float uTime;
+        uniform float uJitter; // Quantum jitter for star
+
+        void main() {
+            vColor = customColor;
+            vec3 pos = position;
+
+            // Subtle vibration logic
+            if (uJitter > 0.0) {
+                 float vib = sin(uTime * 20.0 + position.y) * uJitter;
+                 pos += vec3(vib*0.2); 
+            }
+
+            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+
+            // Distance based scaling (Parallax Size)
+            float distSize = 400.0 / -mvPosition.z;
+            // Pulsing light logic
+            float pulse = 1.0 + sin(uTime * 4.0 + position.x) * 0.15;
+            
+            gl_PointSize = size * pulse * distSize;
+            vAlpha = smoothstep(80.0, 5.0, -mvPosition.z);
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="fragmentShader">
+        uniform sampler2D pointTexture;
+        varying vec3 vColor;
+        varying float vAlpha;
+        void main() {
+            vec4 tex = texture2D(pointTexture, gl_PointCoord);
+            gl_FragColor = vec4(vColor, vAlpha) * tex;
+            if(gl_FragColor.a < 0.05) discard;
+        }
+    </script>
+
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- VARS ---
+        let currentMode = 'tree'; 
+        let spinVelX=0, spinVelY=0, decay=0.96;
+        let expansionTarget = 0.0, currentExpansion = 0.0;
+        let prevHandX=0.5, prevHandY=0.5;
+        let handOpenness=0.0;
+        let isHandDetected=false;
+
+        // --- THREE SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x000000, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 500);
+        camera.position.z = 22; // Good viewing distance
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // Balance performance/quality
+        document.body.appendChild(renderer.domElement);
+
+        // --- FLARE TEXTURE ---
+        function createFlare() {
+            const size = 128;
+            const c = document.createElement('canvas');
+            c.width = size; c.height = size;
+            const ctx = c.getContext('2d');
+            const grad = ctx.createRadialGradient(size/2,size/2,0,size/2,size/2,size/2);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(0.2, 'rgba(255,255,255,0.8)');
+            grad.addColorStop(0.5, 'rgba(255,255,255,0.2)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad; ctx.fillRect(0,0,size,size);
+            return new THREE.CanvasTexture(c);
+        }
+        const tex = createFlare();
+
+        // --- GEOMETRY FACTORY ---
+        function createSystem(mode, count) {
+            const pos = new Float32Array(count * 3);
+            const col = new Float32Array(count * 3);
+            const size = new Float32Array(count);
+            
+            // Physics attributes stored in user data
+            // Meta: x, y, z (Original Direction)
+            const meta = new Float32Array(count * 3);
+            const orig = new Float32Array(count * 3);
+            const drag = new Float32Array(count); // How fast it expands
+
+            for(let i=0; i<count; i++) {
+                let vec = new THREE.Vector3();
+                let mySize, myCol, myDrag;
+                
+                if (mode === 'tree') {
+                    // --- REALISTIC FIR TREE ALGO ---
+                    // 7 Stacked Cones (Tiers)
+                    const treeHeight = 26;
+                    const maxBaseW = 12;
+                    const tiers = 7;
+                    
+                    const tierIdx = Math.floor(Math.random() * tiers); // 0 (Top) to 6 (Bottom)
+                    
+                    // Height Calculation
+                    const tierH = treeHeight / tiers;
+                    const tierBaseY = (treeHeight/2) - (tierIdx * tierH); 
+                    
+                    // Width Calculation: Lower tiers are wider
+                    // Tier 0 width = 1. Tier 6 width = maxBaseW.
+                    const tierMaxR = 1 + (tierIdx / (tiers-1)) * maxBaseW;
+                    
+                    // Local placement within the cone of this tier
+                    const localY = Math.random() * tierH; // Position down the branch
+                    const coneRatio = localY / tierH; // 0 = top of branch, 1 = tip of branch
+                    const rMax = tierMaxR * coneRatio; // Linear cone expansion
+                    
+                    // Random Volume (80%) vs Surface (20%)
+                    const isSurface = Math.random() > 0.7;
+                    const r = isSurface ? rMax * (0.8 + Math.random()*0.4) : Math.random()*rMax;
+                    const th = Math.random() * Math.PI*2;
+                    
+                    vec.set(r*Math.cos(th), tierBaseY - localY, r*Math.sin(th));
+                    
+                    // Color Logic
+                    const isLight = isSurface && Math.random() > 0.6; // Ornaments/Lights
+                    if(isLight) {
+                        const rnd = Math.random();
+                        if(rnd > 0.7) myCol = new THREE.Color(0xff0000); // Red
+                        else if(rnd > 0.4) myCol = new THREE.Color(0xffd700); // Gold
+                        else myCol = new THREE.Color(0x00ffff); // Cyan
+                        
+                        mySize = 1.2; 
+                        myDrag = 0.5; // Heavy decorations stay closer to center during expansion
+                    } else {
+                        // Needles (Dark Green + Frost tips)
+                        myCol = Math.random() > 0.5 ? new THREE.Color(0x005500) : new THREE.Color(0x228b22);
+                        if (Math.random()>0.9) myCol = new THREE.Color(0xffffff); // Frost
+                        mySize = 0.45;
+                        myDrag = 2.0; // Leaves/Dust fly VERY far (High expansion)
+                    }
+
+                } else {
+                    // --- RED GIANT STAR ALGO ---
+                    // Split: Core (White/Yellow) vs Nebula (Red)
+                    const isCore = Math.random() < 0.25;
+
+                    if (isCore) {
+                        // Dense, Slow, Bright
+                        const r = 2.0 * Math.cbrt(Math.random());
+                        const phi = Math.acos(2*Math.random()-1);
+                        const theta = Math.random()*Math.PI*2;
+                        vec.set(r*Math.sin(phi)*Math.cos(theta), r*Math.sin(phi)*Math.sin(theta), r*Math.cos(phi));
+                        myCol = new THREE.Color(0xffffff);
+                        mySize = 0.8;
+                        myDrag = 0.2; // Stays center
+                    } else {
+                        // Nebula Rays - RED!
+                        // Distribute mainly in "rays" but fuzzy
+                        const arm = Math.floor(Math.random() * 6);
+                        const a = arm * (Math.PI*2/6);
+                        
+                        // Push further out
+                        const d = 3 + Math.random() * 15; 
+                        const spread = 2.0; // Wide fuzzy beams
+                        const x = Math.cos(a)*d + (Math.random()-0.5)*spread;
+                        const y = Math.sin(a)*d + (Math.random()-0.5)*spread;
+                        const z = (Math.random()-0.5)*5.0; // Volume depth
+                        vec.set(x,y,z);
+
+                        // VIVID RED PALETTE
+                        const paletteRed = Math.random();
+                        if(paletteRed > 0.6) myCol = new THREE.Color('#ff0000'); // Pure Red
+                        else if (paletteRed > 0.3) myCol = new THREE.Color('#dc143c'); // Crimson
+                        else myCol = new THREE.Color('#ff4500'); // Orange Red
+                        
+                        mySize = 0.35 + Math.random() * 0.4;
+                        // High drag means they expand furthest "Behind the core" visually if projected deep
+                        myDrag = 1.5 + Math.random(); 
+                    }
+                }
+
+                // Arrays
+                pos.set([vec.x, vec.y, vec.z], i*3);
+                orig.set([vec.x, vec.y, vec.z], i*3);
+                
+                // Direction normalized
+                const len = Math.sqrt(vec.x*vec.x + vec.y*vec.y + vec.z*vec.z) || 1;
+                meta.set([vec.x/len, vec.y/len, vec.z/len], i*3);
+                
+                col.set([myCol.r, myCol.g, myCol.b], i*3);
+                size[i] = mySize;
+                drag[i] = myDrag;
+            }
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            geo.setAttribute('customColor', new THREE.BufferAttribute(col, 3));
+            geo.setAttribute('size', new THREE.BufferAttribute(size, 1));
+
+            const uniforms = {
+                pointTexture: { value: tex },
+                uTime: { value: 0 },
+                uJitter: { value: 0 }
+            };
+
+            const mat = new THREE.ShaderMaterial({
+                uniforms,
+                vertexShader: document.getElementById('vertexShader').textContent,
+                fragmentShader: document.getElementById('fragmentShader').textContent,
+                blending: THREE.AdditiveBlending, depthWrite: false, transparent: true
+            });
+
+            const mesh = new THREE.Points(geo, mat);
+            mesh.userData = { orig, meta, drag }; // Physics Data
+            return mesh;
+        }
+
+        const sysTree = createSystem('tree', 7000);
+        const sysStar = createSystem('star', 7000);
+
+        scene.add(sysTree);
+        scene.add(sysStar);
+        sysStar.visible = false;
+
+
+        // --- MAIN LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+            const group = currentMode === 'tree' ? sysTree : sysStar;
+
+            // Shader time
+            group.material.uniforms.uTime.value = time;
+
+            // SPIN Physics
+            group.rotation.y += spinVelX;
+            group.rotation.x += spinVelY;
+            spinVelX *= decay; 
+            spinVelY *= decay;
+
+            // Expansion State
+            const isSwiping = Math.abs(spinVelX) > 0.05 || Math.abs(spinVelY) > 0.05;
+            
+            if (isHandDetected) {
+                // If Hand Openness is high -> Huge Expansion
+                if (!isSwiping) {
+                    // Tree Expand Limit = 120 (Fill screen completely!)
+                    // Star Expand Limit = 80 (Push Red cloud way back)
+                    const limit = currentMode === 'tree' ? 120.0 : 80.0;
+                    
+                    // Jitter Effect for Star only (Simulate instability)
+                    if(currentMode === 'star') {
+                        group.material.uniforms.uJitter.value = handOpenness * 0.5;
+                    }
+
+                    const target = handOpenness * limit;
+                    currentExpansion += (target - currentExpansion) * 0.06;
+                }
+            } else {
+                currentExpansion += (0 - currentExpansion) * 0.05;
+                group.rotation.y -= 0.001;
+                group.material.uniforms.uJitter.value = 0;
+            }
+
+            // --- CPU PARALLAX UPDATE ---
+            const pos = group.geometry.attributes.position.array;
+            const orig = group.userData.orig;
+            const meta = group.userData.meta;
+            const drag = group.userData.drag;
+            const count = group.geometry.attributes.position.count;
+
+            for(let i=0; i<count; i++) {
+                const i3=i*3;
+                const ox=orig[i3], oy=orig[i3+1], oz=orig[i3+2]; // Original Pos
+                const dx=meta[i3], dy=meta[i3+1], dz=meta[i3+2]; // Direction
+                const d=drag[i]; // Expansion multiplier
+                
+                // Parallax Math
+                const travel = currentExpansion * d;
+                // Add independent 'Life' drift
+                const life = Math.sin(time + ox*0.5) * 0.2;
+
+                // Move outward along vector
+                pos[i3] = ox + dx * travel;
+                pos[i3+1] = oy + dy * travel + life; 
+                pos[i3+2] = oz + dz * travel;
+            }
+            group.geometry.attributes.position.needsUpdate = true;
+
+            sysTree.visible = (currentMode === 'tree');
+            sysStar.visible = (currentMode === 'star');
+            
+            renderer.render(scene, camera);
+        }
+        animate();
+
+
+        // --- UI ---
+        window.setMode = (m) => {
+            currentMode = m;
+            document.getElementById('btn-tree').className = m==='tree' ? 'btn active' : 'btn';
+            document.getElementById('btn-star').className = m==='star' ? 'btn star active' : 'btn';
+            spinVelX=0; spinVelY=0;
+        }
+
+        window.onresize = () => { camera.aspect=window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); };
+
+        
+        // --- INPUT ENGINE ---
+        const video = document.getElementById('webcam');
+        function onResults(res) {
+            if(res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+                isHandDetected = true;
+                const lm = res.multiHandLandmarks[0];
+                const cx = 1.0 - lm[9].x; const cy = lm[9].y;
+
+                // Momentum
+                const dx = cx - prevHandX; const dy = cy - prevHandY;
+                if(Math.abs(dx)>0.004 || Math.abs(dy)>0.004) {
+                    spinVelX += dx*0.8; spinVelY += dy*0.8;
+                    spinVelX = Math.max(-0.5,Math.min(0.5,spinVelX));
+                    spinVelY = Math.max(-0.5,Math.min(0.5,spinVelY));
+                }
+                prevHandX=cx; prevHandY=cy;
+
+                // Openness (Ratio based on wrist-tip vs wrist-knuckle)
+                const w=lm[0], t=lm[12], b=lm[9];
+                const full=Math.hypot(w.x-t.x, w.y-t.y);
+                const base=Math.hypot(w.x-b.x, w.y-b.y);
+                handOpenness = Math.max(0, Math.min(1, (full/base - 1.0)/0.7));
+            } else { isHandDetected = false; }
+        }
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5});
+        hands.onResults(onResults);
+        
+        const cam = new Camera(video, {onFrame:async()=>{await hands.send({image:video})}, width:1280, height:720});
+        cam.start();
+
+    </script>
+</body>
+</html>
